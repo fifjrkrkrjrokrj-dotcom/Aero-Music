@@ -1,377 +1,370 @@
-# Licensed under the MIT License.
-# This file is part of AeroXMusic
-
-
-import io
+import asyncio
 import os
 import re
-import time
-import random
-import asyncio
+from typing import Union
+import yt_dlp
+from pyrogram.enums import MessageEntityType
+from pyrogram.types import Message
+from py_yt import VideosSearch, Playlist
 import aiohttp
-from pathlib import Path
+import aiofiles
 
-from py_yt import Playlist, VideosSearch
+API_URL = os.environ.get("SHRUTI_API_URL", "https://api.shrutibots.in")
 
-from aero import app, config, db, logger
-from aero.helpers import Track, utils
+API_KEY = os.environ.get("SHRUTI_API_KEY", "ShrutiBotszkdLh2Fkn1TVwS1T3bnN")  ## Get This API KEY FROM https://dash.shrutibots.in                                                    
 
-# Circuit-breaker tuning for the primary streaming API.
-FAILURE_THRESHOLD = 10
-COOLDOWN = 24 * 60 * 60  # 24 hours in seconds
+DOWNLOAD_DIR = "downloads"
+
+_session = None
+
+async def get_session() -> aiohttp.ClientSession:
+    global _session
+    if _session is None or _session.closed:
+        connector = aiohttp.TCPConnector(limit=100, keepalive_timeout=60, enable_cleanup_closed=True)
+        _session = aiohttp.ClientSession(connector=connector)
+    return _session
 
 
-class YouTube:
-    def __init__(self):
-        self.base = "https://www.youtube.com/watch?v="
-        self.cookies = []
-        self.checked = False
-        self.cookie_dir = "aero/cookies"
-        self.warned = False
-        # Circuit-breaker state for the primary API.
-        self._fail_count = 0
-        self._disabled_until = 0.0
-        self.regex = re.compile(
-            r"(https?://)?(www\.|m\.|music\.)?"
-            r"(youtube\.com/(watch\?v=|shorts/|playlist\?list=)|youtu\.be/)"
-            r"([A-Za-z0-9_-]{11}|PL[A-Za-z0-9_-]+)([&?][^\s]*)?"
-        )
-        self.iregex = re.compile(
-            r"https?://(?:www\.|m\.|music\.)?(?:youtube\.com|youtu\.be)"
-            r"(?!/(watch\?v=[A-Za-z0-9_-]{11}|shorts/[A-Za-z0-9_-]{11}"
-            r"|playlist\?list=PL[A-Za-z0-9_-]+|[A-Za-z0-9_-]{11}))\S*"
-        )
+def _env_dir(name: str) -> str:
+    value = os.environ.get(name, "").strip()
+    return os.path.abspath(os.path.expanduser(value)) if value else ""
 
-    def get_cookies(self):
-        if not self.checked:
-            for file in os.listdir(self.cookie_dir):
-                if file.endswith(".txt"):
-                    self.cookies.append(f"{self.cookie_dir}/{file}")
-            self.checked = True
-        if not self.cookies:
-            if not self.warned:
-                self.warned = True
-                logger.warning("Cookies are missing; downloads might fail.")
-            return None
-        return random.choice(self.cookies)
 
-    async def save_cookies(self, urls: list[str]) -> None:
-        logger.info("Saving cookies from urls...")
-        async with aiohttp.ClientSession() as session:
-            for url in urls:
-                name = url.split("/")[-1]
-                link = "https://batbin.me/raw/" + name
-                async with session.get(link) as resp:
-                    resp.raise_for_status()
-                    with open(f"{self.cookie_dir}/{name}.txt", "wb") as fw:
-                        fw.write(await resp.read())
-        logger.info(f"Cookies saved in {self.cookie_dir}.")
+AUDIO_DOWNLOAD_PATH = _env_dir("AUDIO_DOWNLOAD_PATH")
+VIDEO_DOWNLOAD_PATH = _env_dir("VIDEO_DOWNLOAD_PATH")
+AUDIO_EXTENSIONS = ("webm", "m4a", "mp3", "ogg")
+VIDEO_EXTENSIONS = ("mp4", "mkv", "webm")
 
-    def valid(self, url: str) -> bool:
-        return bool(re.match(self.regex, url))
 
-    def invalid(self, url: str) -> bool:
-        return bool(re.match(self.iregex, url))
+def is_external_path(path) -> bool:
+    if not path:
+        return False
+    full = os.path.abspath(str(path))
+    for base in (AUDIO_DOWNLOAD_PATH, VIDEO_DOWNLOAD_PATH):
+        if base and full.startswith(base + os.sep):
+            return True
+    return False
 
-    async def search(self, query: str, m_id: int, video: bool = False) -> Track | None:
-        logger.info("API → yt-search: %r", query)
-        try:
-            _search = VideosSearch(query, limit=1, with_live=False)
-            results = await _search.next()
-        except Exception as ex:
-            logger.warning("yt-search failed for %r: %s", query, ex)
-            return None
-        if results and results["result"]:
-            data = results["result"][0]
-            logger.info("API ← yt-search: %s | %s", data.get("id"), (data.get("title") or "")[:40])
-            return Track(
-                id=data.get("id"),
-                channel_name=data.get("channel", {}).get("name"),
-                duration=data.get("duration"),
-                duration_sec=utils.to_seconds(data.get("duration")),
-                message_id=m_id,
-                title=data.get("title")[:25],
-                thumbnail=data.get("thumbnails", [{}])[-1].get("url").split("?")[0],
-                url=data.get("link"),
-                view_count=data.get("viewCount", {}).get("short"),
-                video=video,
-            )
+
+def _find_external(directory: str, video_id: str, extensions, resp=None):
+    names = []
+    if resp is not None:
+        disposition = resp.content_disposition
+        if disposition and disposition.filename:
+            name = os.path.basename(disposition.filename)
+            if name.startswith(video_id + "."):
+                names.append(name)
+    names.extend(f"{video_id}.{ext}" for ext in extensions)
+    for name in names:
+        path = os.path.join(directory, name)
+        if os.path.isfile(path) and os.path.getsize(path) > 0:
+            return path
+    return None
+
+
+def time_to_seconds(time):
+    stringt = str(time)
+    return sum(int(x) * 60 ** i for i, x in enumerate(reversed(stringt.split(":"))))
+
+
+async def _download_media(link: str, kind: str, timeout: int) -> str:
+    video_id = link.split("v=")[-1].split("&")[0] if "v=" in link else link
+    if not video_id or len(video_id) < 3:
         return None
 
-    async def playlist(self, limit: int, user: str, url: str, video: bool) -> list[Track | None]:
-        tracks = []
-        logger.info("API → yt-playlist: %s (limit %d)", url, limit)
-        try:
-            plist = await Playlist.get(url)
-            for data in plist["videos"][:limit]:
-                track = Track(
-                    id=data.get("id"),
-                    channel_name=data.get("channel", {}).get("name", ""),
-                    duration=data.get("duration"),
-                    duration_sec=utils.to_seconds(data.get("duration")),
-                    title=data.get("title")[:25],
-                    thumbnail=data.get("thumbnails")[-1].get("url").split("?")[0],
-                    url=data.get("link").split("&list=")[0],
-                    user=user,
-                    view_count="",
-                    video=video,
-                )
-                tracks.append(track)
-            logger.info("API ← yt-playlist: %d tracks", len(tracks))
-        except Exception as ex:
-            logger.warning("yt-playlist failed for %s: %s", url, ex)
-        return tracks
+    is_audio = kind == "audio"
+    external = AUDIO_DOWNLOAD_PATH if is_audio else VIDEO_DOWNLOAD_PATH
+    extensions = AUDIO_EXTENSIONS if is_audio else VIDEO_EXTENSIONS
 
-    # ---------------------------------------------------------------- circuit breaker
-    def _primary_up(self) -> bool:
-        """Return True if the primary API is currently allowed. Auto-resets
-        the breaker once the 24h cooldown has elapsed."""
-        if self._disabled_until:
-            if time.time() >= self._disabled_until:
-                self._disabled_until = 0.0
-                self._fail_count = 0
-                logger.info("Primary YT API cooldown elapsed; re-enabled.")
-            else:
-                return False
-        return True
+    if external:
+        found = _find_external(external, video_id, extensions)
+        if found:
+            return found
 
-    async def _trip_breaker(self) -> None:
-        self._disabled_until = time.time() + COOLDOWN
-        logger.error(
-            "Primary YT API disabled for 24h after %d consecutive failures.",
-            self._fail_count,
-        )
-        try:
-            await app.send_message(
-                config.LOGGER_ID,
-                "<blockquote>⚠️ <b>Primary YouTube API disabled</b>\n\n"
-                f"<b>Consecutive failures:</b> {self._fail_count}\n"
-                "<b>Cooldown:</b> 24 hours\n"
-                "<b>Routing:</b> Fallback API + cache</blockquote>",
-            )
-        except Exception as ex:
-            logger.error("Could not send breaker alert to LOGGER_ID: %s", ex)
+    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+    file_path = os.path.join(DOWNLOAD_DIR, f"{video_id}.{'mp3' if is_audio else 'mp4'}")
+    if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
+        return file_path
 
-    async def _record_failure(self) -> None:
-        self._fail_count += 1
-        if self._fail_count >= FAILURE_THRESHOLD and not self._disabled_until:
-            await self._trip_breaker()
-
-    async def reset_primary(self) -> None:
-        """Manual administrative reset of the primary API breaker."""
-        self._disabled_until = 0.0
-        self._fail_count = 0
-        logger.info("Primary YT API manually reset.")
-
-    # ---------------------------------------------------------------- primary stream
-    async def _primary_stream(self, video_id: str, s_type: str) -> str | None:
-        """Download the track from the primary API's proxy to a LOCAL file and
-        return its path. We deliberately do NOT hand ffmpeg the live proxy URL:
-        the proxy closes long connections after ~2-3 min, which ffmpeg reads as
-        end-of-stream and the assistant leaves the call mid-song. A fully
-        downloaded file plays to the end reliably (same as cached tracks)."""
-        ext = "mp4" if s_type == "video" else "webm"
-        path = f"downloads/{video_id}.{ext}"
-        if Path(path).exists() and os.path.getsize(path) > 0:
-            return path
-
-        # Health-check the API first so the circuit breaker still sees failures.
-        logger.info("API → primary-yt: stream %s (%s)", video_id, s_type)
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    f"{config.YTAPI_URL}/stream",
-                    params={"query": video_id, "type": s_type},
-                    timeout=aiohttp.ClientTimeout(total=30),
-                ) as resp:
-                    if resp.status != 200:
-                        logger.warning(
-                            "Primary API returned HTTP %s for %s", resp.status, video_id
-                        )
-                        return None
-        except asyncio.TimeoutError:
-            logger.warning("Primary API timed out for %s", video_id)
-            return None
-        except aiohttp.ClientError as ex:
-            logger.warning("Primary API request failed for %s: %s", video_id, ex)
-            return None
-
-        # Download the proxy stream to disk (streamed in chunks, no full RAM).
-        proxy = f"{config.YTAPI_URL}/stream/{s_type}/{video_id}"
-        tmp = f"{path}.part"
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    proxy, timeout=aiohttp.ClientTimeout(total=600)
-                ) as resp:
-                    if resp.status != 200:
-                        logger.warning("Proxy stream HTTP %s for %s", resp.status, video_id)
-                        return None
-                    with open(tmp, "wb") as f:
-                        async for chunk in resp.content.iter_chunked(1 << 16):
-                            f.write(chunk)
-        except Exception as ex:
-            logger.warning("Proxy download failed for %s: %s", video_id, ex)
+    try:
+        session = await get_session()
+        async with session.get(
+            f"{API_URL}/download",
+            params={"url": video_id, "type": kind, "api_key": API_KEY},
+            timeout=aiohttp.ClientTimeout(total=timeout)
+        ) as resp:
+            if resp.status != 200:
+                return None
+            if external:
+                found = _find_external(external, video_id, extensions, resp)
+                if found:
+                    return found
+            async with aiofiles.open(file_path, "wb") as f:
+                async for chunk in resp.content.iter_chunked(262144):
+                    await f.write(chunk)
+        if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
+            return file_path
+        return None
+    except Exception:
+        if os.path.exists(file_path):
             try:
-                os.remove(tmp)
+                os.remove(file_path)
             except Exception:
                 pass
-            return None
+        return None
 
-        if not os.path.exists(tmp) or os.path.getsize(tmp) == 0:
-            logger.warning("Proxy download produced empty file for %s", video_id)
-            return None
-        os.replace(tmp, path)
-        logger.info("API ← primary-yt: downloaded %s (%d bytes)", video_id, os.path.getsize(path))
-        return path
 
-    # ---------------------------------------------------------------- fallback pipeline
-    async def _fallback_upload(self, video_id: str, s_type: str) -> str | None:
-        """Fetch the file from the fallback API straight into RAM, upload it to
-        the storage channel, and return the resulting Telegram file_id. No disk."""
-        ext = "mp4" if s_type == "video" else "webm"
-        logger.info("API → fallback-yt: download %s (%s)", video_id, s_type)
+async def download_song(link: str) -> str:
+    return await _download_media(link, "audio", 300)
+
+
+async def download_video(link: str) -> str:
+    return await _download_media(link, "video", 600)
+
+
+AUTOPLAY_REQUEST_TIMEOUT = 20
+AUTOPLAY_MAX_RETRIES = 3
+AUTOPLAY_RETRY_DELAY = 1
+AUTOPLAY_RETRYABLE_STATUS = (408, 425, 429, 500, 502, 503, 504)
+
+
+async def get_autoplay(
+    video_id: str,
+    timeout: int = AUTOPLAY_REQUEST_TIMEOUT,
+    retries: int = AUTOPLAY_MAX_RETRIES,
+    seed_id: str = None,
+) -> list:
+    video_id = video_id.split("v=")[-1].split("&")[0] if "v=" in video_id else video_id
+    if not video_id or len(video_id) < 3:
+        return []
+
+    params = {"video_id": video_id, "api_key": API_KEY}
+    if seed_id and seed_id != video_id:
+        params["seed_id"] = seed_id
+
+    attempt = 0
+    while attempt < retries:
+        attempt += 1
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(
-                    f"{config.FALLBACK_URL}/download",
-                    params={
-                        "url": video_id,
-                        "type": s_type,
-                        "api_key": config.FALLBACK_APIKEY,
-                    },
-                    timeout=aiohttp.ClientTimeout(total=300),
+                    f"{API_URL}/autoplay",
+                    params=params,
+                    timeout=aiohttp.ClientTimeout(total=timeout),
                 ) as resp:
-                    if resp.status != 200:
-                        logger.error(
-                            "Fallback API returned HTTP %s for %s", resp.status, video_id
+                    if resp.status == 200:
+                        data = await resp.json()
+                        return data.get("tracks", [])
+                    if resp.status in AUTOPLAY_RETRYABLE_STATUS and attempt < retries:
+                        await asyncio.sleep(AUTOPLAY_RETRY_DELAY)
+                        continue
+                    return []
+        except (asyncio.TimeoutError, aiohttp.ClientError):
+            if attempt < retries:
+                await asyncio.sleep(AUTOPLAY_RETRY_DELAY)
+                continue
+            return []
+        except Exception:
+            return []
+
+    return []
+
+
+class YouTubeAPI:
+    def __init__(self):
+        self.base = "https://www.youtube.com/watch?v="
+        self.regex = r"(?:youtube\.com|youtu\.be)"
+        self.status = "https://www.youtube.com/oembed?url="
+        self.listbase = "https://youtube.com/playlist?list="
+        self.reg = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+
+    async def exists(self, link: str, videoid: Union[bool, str] = None):
+        if videoid:
+            link = self.base + link
+        return bool(re.search(self.regex, link))
+
+    async def url(self, message_1: Message) -> Union[str, None]:
+        messages = [message_1]
+        if message_1.reply_to_message:
+            messages.append(message_1.reply_to_message)
+        for message in messages:
+            if message.entities:
+                for entity in message.entities:
+                    if entity.type == MessageEntityType.URL:
+                        text = message.text or message.caption
+                        return text[entity.offset: entity.offset + entity.length]
+            elif message.caption_entities:
+                for entity in message.caption_entities:
+                    if entity.type == MessageEntityType.TEXT_LINK:
+                        return entity.url
+        return None
+
+    async def details(self, link: str, videoid: Union[bool, str] = None):
+        if videoid:
+            link = self.base + link
+        if "&" in link:
+            link = link.split("&")[0]
+        results = VideosSearch(link, limit=1)
+        for result in (await results.next())["result"]:
+            title = result["title"]
+            duration_min = result["duration"]
+            thumbnail = result["thumbnails"][0]["url"].split("?")[0]
+            vidid = result["id"]
+            duration_sec = int(time_to_seconds(duration_min)) if duration_min else 0
+        return title, duration_min, duration_sec, thumbnail, vidid
+
+    async def title(self, link: str, videoid: Union[bool, str] = None):
+        if videoid:
+            link = self.base + link
+        if "&" in link:
+            link = link.split("&")[0]
+        results = VideosSearch(link, limit=1)
+        for result in (await results.next())["result"]:
+            return result["title"]
+
+    async def duration(self, link: str, videoid: Union[bool, str] = None):
+        if videoid:
+            link = self.base + link
+        if "&" in link:
+            link = link.split("&")[0]
+        results = VideosSearch(link, limit=1)
+        for result in (await results.next())["result"]:
+            return result["duration"]
+
+    async def thumbnail(self, link: str, videoid: Union[bool, str] = None):
+        if videoid:
+            link = self.base + link
+        if "&" in link:
+            link = link.split("&")[0]
+        results = VideosSearch(link, limit=1)
+        for result in (await results.next())["result"]:
+            return result["thumbnails"][0]["url"].split("?")[0]
+
+    async def video(self, link: str, videoid: Union[bool, str] = None):
+        if videoid:
+            link = self.base + link
+        if "&" in link:
+            link = link.split("&")[0]
+        try:
+            downloaded_file = await download_video(link)
+            if downloaded_file:
+                return 1, downloaded_file
+            return 0, "Video download failed"
+        except Exception as e:
+            return 0, f"Video download error: {e}"
+
+    async def playlist(self, link, limit, user_id, videoid: Union[bool, str] = None):
+        if videoid:
+            link = self.listbase + link
+        if "&" in link:
+            link = link.split("&")[0]
+        try:
+            plist = await Playlist.get(link)
+        except Exception:
+            return []
+        videos = plist.get("videos") or []
+        ids = []
+        for data in videos[:limit]:
+            if not data:
+                continue
+            vid = data.get("id")
+            if not vid:
+                continue
+            ids.append(vid)
+        return ids
+
+    async def track(self, link: str, videoid: Union[bool, str] = None):
+        if videoid:
+            link = self.base + link
+        if "&" in link:
+            link = link.split("&")[0]
+        cache_key = f"{videoid}_{link}"
+        if hasattr(self, "_track_cache") and cache_key in self._track_cache:
+            return self._track_cache[cache_key]
+        if not hasattr(self, "_track_cache"):
+            self._track_cache = {}
+
+        results = VideosSearch(link, limit=1)
+        res = await results.next()
+        result = res["result"][0]
+        title = result["title"]
+        duration_min = result["duration"]
+        vidid = result["id"]
+        yturl = result["link"]
+        thumbnail = result["thumbnails"][0]["url"].split("?")[0]
+        track_details = {
+            "title": title,
+            "link": yturl,
+            "vidid": vidid,
+            "duration_min": duration_min,
+            "thumb": thumbnail,
+        }
+        self._track_cache[cache_key] = (track_details, vidid)
+        return track_details, vidid
+
+    async def formats(self, link: str, videoid: Union[bool, str] = None):
+        if videoid:
+            link = self.base + link
+        if "&" in link:
+            link = link.split("&")[0]
+        ytdl_opts = {"quiet": True}
+        ydl = yt_dlp.YoutubeDL(ytdl_opts)
+        with ydl:
+            formats_available = []
+            r = ydl.extract_info(link, download=False)
+            for format in r["formats"]:
+                try:
+                    if "dash" not in str(format["format"]).lower():
+                        formats_available.append(
+                            {
+                                "format": format["format"],
+                                "filesize": format.get("filesize"),
+                                "format_id": format["format_id"],
+                                "ext": format["ext"],
+                                "format_note": format["format_note"],
+                                "yturl": link,
+                            }
                         )
-                        return None
-                    body = await resp.read()
-        except asyncio.TimeoutError:
-            logger.error("Fallback API timed out for %s", video_id)
-            return None
-        except aiohttp.ClientError as ex:
-            logger.error("Fallback API request failed for %s: %s", video_id, ex)
-            return None
+                except Exception:
+                    continue
+        return formats_available, link
 
-        if not body:
-            logger.error("Fallback API returned an empty body for %s", video_id)
-            return None
+    async def slider(self, link: str, query_type: int, videoid: Union[bool, str] = None):
+        if videoid:
+            link = self.base + link
+        if "&" in link:
+            link = link.split("&")[0]
+        a = VideosSearch(link, limit=10)
+        result = (await a.next()).get("result")
+        title = result[query_type]["title"]
+        duration_min = result[query_type]["duration"]
+        vidid = result[query_type]["id"]
+        thumbnail = result[query_type]["thumbnails"][0]["url"].split("?")[0]
+        return title, duration_min, thumbnail, vidid
 
-        logger.info("API ← fallback-yt: %s (%d bytes) → uploading to storage", video_id, len(body))
-        buf = io.BytesIO(body)
-        buf.name = f"{video_id}.{ext}"
-        file_id = None
-        try:
-            sent = await app.send_document(
-                config.STORAGE_CHANNEL,
-                buf,
-                caption=f"<code>{video_id}</code> | {s_type}",
-            )
-            file_id = sent.document.file_id
-            logger.info("storage ← cached %s as file_id", video_id)
-        except Exception as ex:
-            logger.error("Failed to upload %s to storage channel: %s", video_id, ex)
-        finally:
-            buf.close()
-        return file_id
-
-    async def _resolve(self, file_id: str, video_id: str, s_type: str) -> str | None:
-        """Materialise a Telegram file_id into a local path the mixer can stream."""
-        ext = "mp4" if s_type == "video" else "webm"
-        path = f"downloads/{video_id}.{ext}"
-        if Path(path).exists():
-            return path
-        try:
-            return await app.download_media(file_id, file_name=path)
-        except Exception as ex:
-            logger.error("Failed to fetch cached file %s: %s", file_id, ex)
-            return None
-
-    @staticmethod
-    def cleanup(path) -> None:
-        """Delete a transient downloaded track from disk. The permanent copy
-        lives in the storage channel (file_id in Mongo), so this keeps the VPS
-        disk from filling — the song re-fetches from Telegram next time."""
-        if isinstance(path, str) and path.startswith("downloads/"):
-            try:
-                os.remove(path)
-            except Exception:
-                pass
-
-    async def _persist(self, video_id: str, video: bool, path: str) -> None:
-        """Upload a freshly-downloaded track to the storage channel and cache
-        its file_id in Mongo, so every future play comes straight from Telegram
-        (no re-download, no growing VPS disk). Runs in the background — never
-        blocks playback."""
-        if not config.STORAGE_CHANNEL:
-            return
-        if await db.get_yt_cache(video_id, video):
-            return  # already cached by another concurrent play
-        try:
-            # Read the file into RAM now, so cleanup deleting it mid-song (a long
-            # track finishing before the upload completes) can't corrupt this.
-            ext = "mp4" if video else "webm"
-            with open(path, "rb") as f:
-                buf = io.BytesIO(f.read())
-            buf.name = f"{video_id}.{ext}"
-            size = buf.getbuffer().nbytes
-            caption = (
-                f"🎧 <b>{'Video' if video else 'Audio'}</b>\n"
-                f"<b>ID:</b> <code>{video_id}</code>\n"
-                f"<b>Link:</b> {self.base}{video_id}\n"
-                f"<b>Size:</b> {size / 1048576:.2f} MB"
-            )
-            sent = await app.send_document(
-                config.STORAGE_CHANNEL, buf, caption=caption
-            )
-            buf.close()
-            file_id = sent.document.file_id
-            await db.set_yt_cache(video_id, video, file_id)
-            logger.info("storage ← cached %s (%d bytes)", video_id, size)
-        except Exception as ex:
-            logger.error("Failed to cache %s to storage: %s", video_id, ex)
-
-    # ---------------------------------------------------------------- entry point
     async def download(
-        self, video_id: str, video: bool = False, duration: int = 0
-    ) -> str | None:
-        # 1. Hard duration limit — reject before touching any API or DB.
-        if duration and duration > config.DL_HARD_LIMIT:
-            logger.info(
-                "Rejected %s: %ss exceeds hard limit of %ss.",
-                video_id, duration, config.DL_HARD_LIMIT,
-            )
-            return None
+        self,
+        link: str,
+        mystic,
+        video: Union[bool, str] = None,
+        videoid: Union[bool, str] = None,
+        songaudio: Union[bool, str] = None,
+        songvideo: Union[bool, str] = None,
+        format_id: Union[bool, str] = None,
+        title: Union[bool, str] = None,
+    ) -> str:
+        if videoid:
+            link = self.base + link
+        try:
+            if video:
+                downloaded_file = await download_video(link)
+            else:
+                downloaded_file = await download_song(link)
+            if downloaded_file:
+                return downloaded_file, True
+            return None, False
+        except Exception:
+            return None, False
 
-        s_type = "video" if video else "audio"
 
-        # 2. Cache FIRST — durable Telegram storage. Any song played before comes
-        #    straight from the storage channel file_id (fast, reliable local
-        #    file), never re-downloaded.
-        cached = await db.get_yt_cache(video_id, video)
-        if cached:
-            path = await self._resolve(cached, video_id, s_type)
-            if path:
-                logger.info("cache ← %s from storage", video_id)
-                return path
-            logger.warning("Cached file for %s unusable; re-fetching.", video_id)
-
-        # 3. Not cached — download fresh from the primary API, then persist it to
-        #    the storage channel + Mongo IN THE BACKGROUND so playback starts
-        #    immediately (upload never blocks the song).
-        if self._primary_up():
-            path = await self._primary_stream(video_id, s_type)
-            if path:
-                self._fail_count = 0
-                asyncio.create_task(self._persist(video_id, video, path))
-                return path
-            await self._record_failure()
-
-        # 4. Primary down/failing — fallback RAM→channel pipeline (also persists).
-        file_id = await self._fallback_upload(video_id, s_type)
-        if not file_id:
-            return None
-        await db.set_yt_cache(video_id, video, file_id)
-        return await self._resolve(file_id, video_id, s_type)
+YouTube = YouTubeAPI()
