@@ -222,16 +222,6 @@ class YouTube:
                         fw.write(await resp.read())
         logger.info(f"Cookies saved in {self.cookie_dir}.")
 
-
-def is_external_path(path) -> bool:
-    if not path:
-        return False
-    full = os.path.abspath(str(path))
-    for base in (AUDIO_DOWNLOAD_PATH, VIDEO_DOWNLOAD_PATH):
-        if base and full.startswith(base + os.sep):
-            return True
-    return False
-
     async def reset_primary(self) -> None:
         logger.info("Primary YT API reset (Shruti API active).")
 
