@@ -112,10 +112,10 @@ again access -> screen -r aero
 ## ✦ 𝖲𝗎𝗉𝗉𝗈𝗋𝗍
 
 <p align="center">
-  <a href="https://t.me/AERO_X_SUPPORT">
+  <a href="https://t.me/olegio">
     <img src="https://img.shields.io/badge/Join-Support%20Group-2CA5E0?style=for-the-badge&logo=telegram" alt="Support">
   </a>
-  <a href="https://t.me/GANGSTR_ADDA">
+  <a href="https://t.me/olegio">
     <img src="https://img.shields.io/badge/Join-Channel-2CA5E0?style=for-the-badge&logo=telegram" alt="Channel">
   </a>
 </p>

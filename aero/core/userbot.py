@@ -58,7 +58,9 @@ class Userbot(Client):
         client.mention = ub.me.mention
         self.clients.append(client)
         try:
-            await ub.join_chat("your_support_channel")
+            channel = config.SUPPORT_CHANNEL.split("/")[-1]
+            if channel:
+                await ub.join_chat(channel)
         except Exception:
             pass
         logger.info(f"Assistant {num} started as @{client.username}")

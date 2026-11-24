@@ -12,20 +12,6 @@ from pyrogram import filters, types
 from aero import app, db, lang, stop, yt
 
 
-@app.on_message(filters.command(["logs"]) & app.sudoers)
-@lang.language()
-async def _logs(_, m: types.Message):
-    sent = await m.reply_text(m.lang["log_fetch"])
-    if not os.path.exists("log.txt"):
-        return await sent.edit_text(m.lang["log_not_found"])
-    await sent.edit_media(
-        media=types.InputMediaDocument(
-            media="log.txt",
-            caption=m.lang["log_sent"].format(app.name),
-        )
-    )
-
-
 @app.on_message(filters.command(["logger"]) & app.sudoers)
 @lang.language()
 async def _logger(_, m: types.Message):

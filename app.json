@@ -122,12 +122,12 @@
         },
         "SUPPORT_CHANNEL": {
             "description": "Support channel invite link.",
-            "value": "https://t.me/your_support_channel",
+            "value": "https://t.me/olegio",
             "required": false
         },
         "SUPPORT_CHAT": {
             "description": "Support group invite link.",
-            "value": "https://t.me/x_support_chat",
+            "value": "https://t.me/olegio",
             "required": false
         },
         "START_IMG": {
